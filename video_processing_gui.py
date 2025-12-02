@@ -19,7 +19,7 @@ import whisper
 from panns_inference import AudioTagging, labels as pann_labels
 import librosa
 import soundfile as sf
-from moviepy.editor import VideoFileClip, AudioFileClip, CompositeVideoClip
+from moviepy import VideoFileClip, AudioFileClip, CompositeVideoClip
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import threading
@@ -35,10 +35,10 @@ if platform.system() == "Windows":
     pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     # Set TESSDATA_PREFIX to the parent directory containing tessdata (not used anymore)
     os.environ["TESSDATA_PREFIX"] = r"C:\Program Files\Tesseract-OCR"
-    PANN_MODEL_PATH = r"C:\Users\arash\panns_data\cnn14.pth"
+    PANN_MODEL_PATH = r"C:\Users\naval\panns_data\cnn14.pth"
 else:
     pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
-    PANN_MODEL_PATH = "/app/models/cnn14.pth"
+    PANN_MODEL_PATH = "/app/models/pann/cnn14.pth"
 
 # --- Suppress extraneous warnings ---
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -117,7 +117,7 @@ def extract_audio(video_path, audio_path):
         raise ValueError("No audio track found in the video.")
     clip.audio.write_audiofile(audio_path, logger=None)
     clip.reader.close()
-    clip.audio.reader.close_proc()
+    clip.audio.reader.close()
 
 def transcribe_audio(audio_file, language=None):
     waveform, sr = preprocess_audio(audio_file)
@@ -222,7 +222,7 @@ def get_ollama_models():
 
 # --- Global Model Loading (with GPU memory cleanup after each load) ---
 logging.info("Loading Whisper model (Large-v2)...")
-whisper_model = whisper.load_model("large-v2")
+whisper_model = whisper.load_model("small")
 free_gpu_memory()
 
 logging.info("Loading PANNs audio detection model...")
@@ -303,13 +303,13 @@ def process_video(video_path, sample_rate=1, draw_boxes=True, save_video=False, 
     # --- Video Properties ---
     clip = VideoFileClip(video_path)
     fps = clip.fps
-    frame_count = int(clip.reader.nframes)
+    frame_count = int(clip.reader.n_frames)
     duration = clip.duration
     width, height = clip.size
     video_format = os.path.splitext(video_path)[1].lower()
     clip.reader.close()
     if clip.audio is not None:
-        clip.audio.reader.close_proc()
+        clip.audio.reader.close()
 
     logging.info("Video properties: Duration: %s, Frames: %d, FPS: %.2f, Resolution: %dx%d, Format: %s",
                  seconds_to_timestr(duration), frame_count, fps, width, height, video_format)
@@ -375,7 +375,7 @@ def process_video(video_path, sample_rate=1, draw_boxes=True, save_video=False, 
     # --- Load Advanced YOLO and BLIP Models (and free GPU memory after each load) ---
     logging.info("Loading advanced YOLO model (YOLO11x)...")
     try:
-        yolo_model = YOLO("yolo11x.pt")
+        yolo_model = YOLO("yolo11s.pt")
         free_gpu()
     except Exception as e:
         logging.error("Error loading YOLO model: %s", str(e))

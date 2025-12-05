@@ -1,46 +1,40 @@
 #!/usr/bin/env python
-# video_processing_cli.py
+# video_processing_gui.py
 
 import os
 import re
 import logging
 import platform
-import psutil
 import numpy as np
-from ultralytics import YOLO
+import cv2
+import json
+import ast  # ADDED: To handle single-quote JSON errors
+import argparse
+import subprocess
+import gc
+import warnings
+from dotenv import load_dotenv
+from openai import OpenAI
+
+# --- Third Party Libraries ---
 import torch
 from PIL import Image
 from transformers import BlipProcessor, BlipForConditionalGeneration
 import whisper
 from panns_inference import AudioTagging, labels as pann_labels
 import librosa
-import soundfile as sf
 from moviepy import VideoFileClip
-import subprocess
-import shutil
-import warnings
-import gc
-import argparse
-from dotenv import load_dotenv  # Loads .env file
-from openai import OpenAI       # OpenAI Client
-import cv2 # Moved import to top level for better practice
+import imageio_ffmpeg 
 
 # --- Load Environment Variables ---
 load_dotenv()
 
-# --- Dynamic Path Setup ---
-if platform.system() == "Windows":
-    PANN_MODEL_PATH = r"C:\Users\naval\panns_data\cnn14.pth"
-else:
-    PANN_MODEL_PATH = "/app/models/pann/cnn14.pth"
-
-# --- Suppress extraneous warnings ---
+# --- Configuration & Logging ---
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-# --- Setup Logging ---
 LOG_FILE = "video_processing.log"
 logging.basicConfig(
     level=logging.INFO,
@@ -51,73 +45,23 @@ logging.basicConfig(
     ]
 )
 
+# --- Path Setup ---
+if platform.system() == "Windows":
+    PANN_MODEL_PATH = r"C:\Users\naval\panns_data\cnn14.pth"
+else:
+    PANN_MODEL_PATH = "cnn14.pth" 
+
 # --- YOLO Class Mapping ---
 CLASS_MAP = {
-    0: "person", 1: "bicycle", 2: "car", 3: "motorcycle", 4: "airplane",
-    5: "bus", 6: "train", 7: "truck", 8: "boat", 9: "traffic light",
-    10: "fire hydrant", 11: "stop sign", 12: "parking meter", 13: "bench",
-    14: "bird", 15: "cat", 16: "dog", 17: "horse", 18: "sheep", 19: "cow",
-    20: "elephant", 21: "bear", 22: "zebra", 23: "giraffe", 24: "backpack",
-    25: "umbrella", 26: "handbag", 27: "tie", 28: "suitcase", 29: "frisbee",
-    30: "skis", 31: "snowboard", 32: "sports ball", 33: "kite",
-    34: "baseball bat", 35: "baseball glove", 36: "skateboard",
-    37: "surfboard", 38: "tennis racket", 39: "bottle", 40: "wine glass",
-    41: "cup", 42: "fork", 43: "knife", 44: "spoon", 45: "bowl",
-    46: "banana", 47: "apple", 48: "sandwich", 49: "orange",
-    50: "brocolli", 51: "carrot", 52: "hot dog", 53: "pizza", 54: "donut",
-    55: "cake", 56: "chair", 57: "couch", 58: "potted plant", 59: "bed",
-    60: "dining table", 61: "toilet", 62: "tv", 63: "laptop", 64: "mouse",
-    65: "remote", 66: "keyboard", 67: "cell phone", 68: "microwave",
-    69: "oven", 70: "toaster", 71: "sink", 72: "refrigerator", 73: "book",
-    74: "clock", 75: "vase", 76: "scissors", 77: "teddy bear",
-    78: "hair drier", 79: "toothbrush"
+    0: "person", 56: "chair", 57: "couch", 58: "potted plant", 
+    60: "dining table", 62: "tv", 63: "laptop", 67: "cell phone"
 }
 
-# --- GPU MEMORY MANAGEMENT ---
-global_yolo_model = None
-global_blip_model = None
-global_blip_processor = None
-
-total_vram_gb = 0
-if torch.cuda.is_available():
-    total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-
-KEEP_MODELS_LOADED = total_vram_gb > 8.0
-logging.info(f"VRAM Detected: {total_vram_gb:.2f} GB. Keep Models Loaded: {KEEP_MODELS_LOADED}")
-
-def free_gpu(force=False):
-    if force or not KEEP_MODELS_LOADED:
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            gc.collect()
-
-def print_hardware_usage():
-    print("=== Hardware Usage ===")
-    print(f"CPU Usage: {psutil.cpu_percent()}%")
-    mem = psutil.virtual_memory()
-    print(f"Memory Usage: {mem.used / (1024 ** 3):.1f} GB / {mem.total / (1024 ** 3):.1f} GB ({mem.percent}%)")
+# --- GPU Utilities ---
+def free_gpu():
     if torch.cuda.is_available():
-        print(f"GPU Memory Allocated: {torch.cuda.memory_allocated() / (1024 ** 3):.2f} GB")
-        print(f"GPU Memory Reserved: {torch.cuda.memory_reserved() / (1024 ** 3):.2f} GB")
-    print("======================\n")
-
-# --- Model Loading Helpers ---
-def get_yolo_model():
-    global global_yolo_model
-    if global_yolo_model is None:
-        logging.info("Loading YOLO model into memory...")
-        global_yolo_model = YOLO("yolo11x.pt")
-    return global_yolo_model
-
-def get_blip_model():
-    global global_blip_model, global_blip_processor
-    if global_blip_model is None or global_blip_processor is None:
-        logging.info("Loading BLIP model into memory...")
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        global_blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        global_blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
-        global_blip_model.to(device)
-    return global_blip_model, global_blip_processor
+        torch.cuda.empty_cache()
+        gc.collect()
 
 def seconds_to_timestr(seconds):
     hrs = int(seconds // 3600)
@@ -125,481 +69,259 @@ def seconds_to_timestr(seconds):
     secs = int(seconds % 60)
     return f"{hrs:02d}:{mins:02d}:{secs:02d}"
 
-# --- Audio Processing ---
-def preprocess_audio(audio_file, sr=32000):
-    waveform, sr = librosa.load(audio_file, sr=sr)
-    if np.max(np.abs(waveform)) > 0:
-        waveform = waveform / np.max(np.abs(waveform))
-    return waveform, sr
+# --- Model Loading ---
+def get_yolo_model():
+    from ultralytics import YOLO
+    logging.info("Loading YOLO model...")
+    return YOLO("yolo11x.pt")
 
+def get_blip_model():
+    logging.info("Loading BLIP model...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+    model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to(device)
+    return model, processor, device
+
+# --- Audio Functions ---
 def extract_audio(video_path, audio_path):
     with VideoFileClip(video_path) as clip:
-        if clip.audio is None:
-            raise ValueError("No audio track found in the video.")
         clip.audio.write_audiofile(audio_path, logger=None)
 
-# --- UPDATED: Return segments for timeline ---
-def transcribe_audio(audio_file, language="en"):  # Force default to English
-    # REMOVED: waveform, sr = preprocess_audio(audio_file) 
-    # Directly use the file extracted by MoviePy, it is cleaner.
-    
-    segments = [] 
-    
+def transcribe_audio(audio_file):
+    logging.info("Loading Whisper (small)...")
+    model = whisper.load_model("small") 
     try:
-        # Load the model with specific decoding options to reduce hallucinations
-        options = dict(language="en", task="transcribe", condition_on_previous_text=False)
-        
-        # Use the raw audio_file directly
-        result = whisper_model.transcribe(audio_file, **options)
-        
-        detected_language = "en" # We forced it
-        transcription = result["text"]
-        segments = result.get("segments", [])
-        
-    except Exception as e:
-        logging.error("Error in audio transcription: %s", str(e))
-        transcription = ""
-        segments = []
-        detected_language = "error"
-    
-    return transcription, segments, detected_language
+        result = model.transcribe(audio_file, language="en", condition_on_previous_text=False)
+        return result["text"], result.get("segments", [])
+    finally:
+        del model
+        free_gpu()
 
 def detect_audio_events(audio_file):
+    logging.info("Running PANNs detection...")
     try:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        pt_path = PANN_MODEL_PATH
+        if not os.path.exists(pt_path):
+            logging.warning(f"PANNs checkpoint not found at {pt_path}. Attempting default load.")
+            pt_path = None 
+
+        model = AudioTagging(checkpoint_path=pt_path, device=device)
         waveform, sr = librosa.load(audio_file, sr=32000)
-        segment_length = 5 * sr 
+        
         events = {}
-        for i in range(0, len(waveform), segment_length):
-            segment = waveform[i:i + segment_length]
-            if len(segment) == 0: continue
-            segment_tensor = torch.tensor(segment, dtype=torch.float32).unsqueeze(0)
-            output = panns_model.inference(segment_tensor)
-            if isinstance(output, dict) and "clipwise_output" in output:
-                clipwise_output = np.array(output["clipwise_output"], dtype=float)
-            else:
-                clipwise_output = np.array(output, dtype=float)
-            if np.max(clipwise_output) < 0.1: continue
-            top_idx = int(np.argmax(clipwise_output))
-            event_label = pann_labels[top_idx] if top_idx < len(pann_labels) else "Unknown"
-            timestamp = i / sr
-            if event_label in events: events[event_label].append(seconds_to_timestr(timestamp))
-            else: events[event_label] = [seconds_to_timestr(timestamp)]
-        if not events: return {"No event": []}
+        segment_len = 5 * sr
+        for i in range(0, len(waveform), segment_len):
+            chunk = waveform[i:i+segment_len]
+            if len(chunk) < sr: continue
+            
+            chunk_tensor = torch.tensor(chunk[None, :]).float().to(device)
+            clipwise_output, _ = model.inference(chunk_tensor)
+            
+            clipwise_output = clipwise_output.cpu().detach().numpy()[0]
+            if np.max(clipwise_output) > 0.2: 
+                idx = np.argmax(clipwise_output)
+                label = pann_labels[idx]
+                time_str = seconds_to_timestr(i/sr)
+                if label not in events: events[label] = []
+                events[label].append(time_str)
         return events
     except Exception as e:
-        logging.error("Error in audio event detection: %s", str(e))
-        return {"Error": []}
-
-def clean_report(text):
-    text = re.sub(r'[\u06F0-\u06F9]+', '', text)
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
-    return text
-
-def describe_position(x_norm, y_norm):
-    if x_norm < 0.33: horz = "left"
-    elif x_norm < 0.66: horz = "center"
-    else: horz = "right"
-    if y_norm < 0.33: vert = "top"
-    elif y_norm < 0.66: vert = "middle"
-    else: vert = "bottom"
-    return f"{horz}, {vert}"
-
-def article_for(label):
-    return "an" if label[0].lower() in "aeiou" else "a"
-
-# --- Global Model Init ---
-logging.info("Loading Whisper model (small)...")
-whisper_model = whisper.load_model("small")
-free_gpu()
-
-logging.info("Loading PANNs audio detection model...")
-panns_model = AudioTagging(checkpoint_path=PANN_MODEL_PATH)
-free_gpu()
-print_hardware_usage()
-
-# --- UPDATED: Prompt to ask for quotes/timeline ---
-def get_viral_prompt(report_text):
-    return (
-        f"""
-        You are an expert Video Content Analyst.
-        Analyze the provided video report (timestamped audio transcript & visual logs) to generate a comprehensive breakdown.
-
-        --- CRITICAL TIMESTAMP LOGIC: MERGING SEGMENTS ---
-        1. The transcript is split into small blocks (e.g., `[00:04:14 --> 00:04:24]`).
-        2. A complete sentence often flows across multiple blocks.
-        3. You MUST **MERGE** the timestamps for the full context.
-        4. **METHOD**:
-           - Identify the **First Block** where the quote starts. Take its **Start Time**.
-           - Identify the **Last Block** where the quote ends. Take its **End Time**.
-           - Combine them into one range: `[Start of First --> End of Last]`.
-        
-        *Example of Merging:*
-        - Block A: `[00:04:14 --> 00:04:24] I think that video...`
-        - Block B: `[00:04:24 --> 00:04:29] ...is the future.`
-        - **YOUR OUTPUT**: `[00:04:14 --> 00:04:29]` (Start of A to End of B)
-        -------------------------------------------------------------
-
-        ### 1. VIDEO OVERVIEW
-        * **Genre:** (Identify the genre)
-        * **Summary:** (A cohesive narrative paragraph describing the flow)
-        * **Target Audience:** (Who is this video for?)
-
-        ### 2. ENGAGING DESCRIPTION (Social Media Ready)
-        * **Hook:** (The opening line)
-        * **Body:** (The core message/story)
-        * **Key Takeaways:** (Bullet points of main features)
-
-        ### 3. IMPORTANT TIMESTAMPS
-        Select the most critical moments. 
-        * **The Hook:** [Start --> End] - "Exact quote from transcript..." - (Description)
-        * **The Conflict:** [Start --> End] - "Exact quote from transcript..." - (Description)
-        * **The Climax/Solution:** [Start --> End] - "Exact quote from transcript..." - (Description)
-        * **Key Highlight:** [Start --> End] - "Exact quote from transcript..." - (Description)
-        * **The Viral Moment:** [Start --> End] - "Exact quote from transcript..." - (Description)
-        * **Conclusion:** [Start --> End] - "Exact quote from transcript..." - (Description)
-
-        ### 4. VIRAL EDIT STRATEGY
-        * **Best Short Clip:** [Start Time --> End Time] (MERGE blocks if necessary to capture the full thought)
-        * **Transcript:** (The full dialogue spoken during this merged timeframe)
-        * **Reasoning:** (Why this segment is the best)
-
-        ---
-        REPORT DATA:
-        {report_text}
-        """
-    )
+        logging.error(f"Audio Event Error: {e}")
+        return {}
+    finally:
+        free_gpu()
 
 # --- LLM Functions ---
-def call_ollama(prompt, model):
-    """Executes local Ollama model."""
-    try:
-        logging.info(f"Sending request to Ollama ({model})...")
-        result = subprocess.run(
-            ["ollama", "run", model],
-            input=prompt,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=300 
-        )
-        if result.returncode != 0:
-            logging.error("Ollama call failed: %s", result.stderr)
-            return "LLM call failed."
-        output = re.sub(r'<think>.*?</think>', '', result.stdout, flags=re.DOTALL).strip()
-        return output if output else "No response received."
-    except Exception as e:
-        logging.error("Error calling Ollama: %s", str(e))
-        return "Error in LLM call."
-
 def call_openai(prompt, model="gpt-4o"):
-    """Executes OpenAI model via API."""
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        logging.error("OPENAI_API_KEY not found in environment variables.")
-        return "Error: Missing OPENAI_API_KEY."
-
-    logging.info(f"Sending request to OpenAI ({model})...")
-    client = OpenAI(api_key=api_key)
-    
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     try:
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "You are a helpful video analysis assistant."},
+                {"role": "system", "content": "You are a professional Video Editor."},
                 {"role": "user", "content": prompt}
             ]
         )
         return response.choices[0].message.content
     except Exception as e:
-        logging.error(f"OpenAI API Error: {e}")
-        return f"Error calling OpenAI: {e}"
+        return str(e)
+
+def get_viral_prompt(report_text):
+    return f"""
+    Analyze the video report below.
+    TASK: Identify 5-7 most engaging video segments for a "Highlight Reel".
+    
+    CRITICAL OUTPUT FORMAT:
+    - Return ONLY valid JSON.
+    - Use DOUBLE QUOTES (") for all keys and strings.
+    - Do NOT use single quotes.
+    - Format: List of dictionaries.
+    
+    Structure:
+    [
+        {{
+            "start": "HH:MM:SS",
+            "end": "HH:MM:SS", 
+            "title": "Short Title",
+            "description": "Overlay Text (Max 5 words)",
+            "reasoning": "Why this clip matters"
+        }}
+    ]
+    
+    REPORT DATA:
+    {report_text}
+    """
 
 def generate_video_descriptions(model_arg):
-    """
-    Decides which model backend to use based on the --model argument.
-    """
-    report_file = "report.txt"
-    if not os.path.exists(report_file):
-        logging.error("Report file not found.")
+    """Generates viral_cuts.json with robust error handling."""
+    if not os.path.exists("report.txt"):
+        logging.error("report.txt not found.")
         return
 
+    with open("report.txt", "r", encoding="utf-8") as f:
+        report_text = f.read()
+
+    model = "gpt-4o" 
+    logging.info(f"Generating viral cuts using {model}...")
+    
+    response = call_openai(get_viral_prompt(report_text), model)
+    
+    # --- ROBUST JSON PARSING ---
+    data = []
     try:
-        with open(report_file, "r", encoding="utf-8") as f:
-            report_text = f.read()
-    except Exception as e:
-        logging.error(f"Error reading report: {e}")
-        return
-
-    clean_text = clean_report(report_text)
-    shared_prompt = get_viral_prompt(clean_text)
-
-    # --- SMART MODEL SELECTION LOGIC ---
-    run_openai_flag = False
-    run_ollama_flag = False
-    
-    # 1. Check for "Both"
-    if model_arg.lower() == "both":
-        run_openai_flag = True
-        run_ollama_flag = True
-        openai_model = "gpt-4o"
-        ollama_model = "llama3" # Default if not specified
-        logging.info("Model set to 'both'. Running OpenAI (gpt-4o) and Ollama (llama3).")
-
-    # 2. Check for OpenAI (starts with gpt)
-    elif model_arg.lower().startswith("gpt"):
-        run_openai_flag = True
-        openai_model = model_arg
-        logging.info(f"Detected OpenAI model: {openai_model}")
-
-    # 3. Default to Ollama for everything else (llama3, mistral, etc)
-    else:
-        run_ollama_flag = True
-        ollama_model = model_arg
-        logging.info(f"Detected Ollama model: {ollama_model}")
-
-    # --- EXECUTION ---
-    
-    # Run Ollama
-    if run_ollama_flag:
-        ollama_summary = call_ollama(shared_prompt, model=ollama_model)
-        try:
-            with open("video_description_ollama.txt", "w", encoding="utf-8") as f:
-                f.write(f"--- Generated by Ollama ({ollama_model}) ---\n\n")
-                f.write(ollama_summary)
-            logging.info("Saved video_description_ollama.txt")
-        except Exception as e:
-            logging.error(f"Error saving Ollama description: {e}")
-
-    # Run OpenAI
-    if run_openai_flag:
-        openai_summary = call_openai(shared_prompt, model=openai_model)
-        try:
-            with open("video_description_openai.txt", "w", encoding="utf-8") as f:
-                f.write(f"--- Generated by OpenAI ({openai_model}) ---\n\n")
-                f.write(openai_summary)
-            logging.info("Saved video_description_openai.txt")
-        except Exception as e:
-            logging.error(f"Error saving OpenAI description: {e}")
-
-# --- UPDATED: Process Video (Deduplication + Timeline Write) ---
-def process_video(video_path, model_name, sample_rate=1):
-    if not os.path.exists(video_path):
-        logging.error("File does not exist: %s", video_path)
-        return
-
-    # --- FIX: Convert Corrupt/AV1 Video to H.264 automatically ---
-    import imageio_ffmpeg 
-    fixed_video_path = os.path.splitext(video_path)[0] + "_fixed_h264.mp4"
-    
-    if not os.path.exists(fixed_video_path):
-        logging.info(f"Checking/Converting video format for stability: {video_path}")
-        try:
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-            subprocess.run([
-                ffmpeg_exe, "-y", "-i", video_path,
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                "-c:a", "aac", fixed_video_path
-            ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            logging.info("Video conversion complete.")
-        except Exception as e:
-            logging.error(f"Video conversion failed: {e}")
-            logging.warning("Proceeding with original file.")
-            fixed_video_path = video_path 
-
-    video_path = fixed_video_path
-
-    # --- Video Properties ---
-    clip = VideoFileClip(video_path)
-    fps = clip.fps
-    frame_count = int(clip.reader.n_frames)
-    duration = clip.duration
-    width, height = clip.size
-    video_format = os.path.splitext(video_path)[1].lower()
-    clip.close()
-
-    logging.info("Video properties: Duration: %s, Frames: %d, FPS: %.2f", seconds_to_timestr(duration), frame_count, fps)
-
-    # --- Report Setup ---
-    report_lines = []
-    report_lines.append("Video Processing Report")
-    report_lines.append(f"File: {video_path}")
-    report_lines.append(f"Duration: {seconds_to_timestr(duration)}")
-    report_lines.append("")
-
-    # --- Audio Analysis ---
-    temp_audio_path = "temp_audio.wav"
-    logging.info("Extracting audio...")
-    extract_audio(video_path, temp_audio_path)
-
-    audio_transcript = ""
-    audio_segments = [] # Variable for segments
-    
-    if os.path.exists(temp_audio_path):
-        logging.info("Transcribing audio...")
-        # Unpack the 3 values
-        audio_transcript, audio_segments, _ = transcribe_audio(temp_audio_path)
+        # 1. Try to find the list content specifically
+        start_index = response.find('[')
+        end_index = response.rfind(']') + 1
         
-        logging.info("Detecting audio events...")
-        audio_events = detect_audio_events(temp_audio_path)
-        os.remove(temp_audio_path)
-    else:
-        audio_events = {"No audio": []}
+        if start_index != -1 and end_index != -1:
+            json_str = response[start_index:end_index]
+            
+            # 2. Try Standard JSON Load
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError:
+                logging.warning("JSON Decode failed. Trying Python Literal Eval (Single Quotes fix)...")
+                # 3. Fallback: Python Literal Eval (Handles single quotes)
+                try:
+                    data = ast.literal_eval(json_str)
+                except Exception as e:
+                    logging.error(f"Failed to parse AI output: {e}")
+                    logging.info(f"Raw Output: {json_str}")
+                    return # Exit if we can't parse
+            
+            # 4. Save Bridge File (viral_cuts.json)
+            with open("viral_cuts.json", "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+            logging.info("SUCCESS: 'viral_cuts.json' saved.")
+            
+            # 5. Save Readable Report (viral_report.txt)
+            report_lines = ["--- VIRAL VIDEO PLAN ---", ""]
+            for clip in data:
+                report_lines.append(f"[{clip['start']} - {clip['end']}] {clip['title']}")
+                report_lines.append(f"   Overlay: {clip['description']}")
+                report_lines.append(f"   Why: {clip['reasoning']}\n")
+                
+            with open("viral_report.txt", "w", encoding="utf-8") as f:
+                f.write("\n".join(report_lines))
+            logging.info("SUCCESS: 'viral_report.txt' saved.")
+            
+        else:
+            logging.error("LLM did not return a list brackets [].")
+            logging.info(f"Raw response: {response}")
 
-    # --- NEW: Write detailed transcript to report ---
-    report_lines.append("=== TIMELINED AUDIO TRANSCRIPT ===")
-    if audio_segments:
-        for seg in audio_segments:
-            start_str = seconds_to_timestr(seg['start'])
-            end_str = seconds_to_timestr(seg['end'])
-            text = seg['text'].strip()
-            report_lines.append(f"[{start_str} --> {end_str}] {text}")
-    else:
-        report_lines.append("No dialogue detected.")
+    except Exception as e:
+        logging.error(f"Critical Error in JSON Generation: {e}")
+
+# --- Main Logic ---
+def process_video(video_path, model_name, sample_rate=250):
+    if not os.path.exists(video_path):
+        logging.error(f"File {video_path} not found.")
+        return
+
+    # 1. Audio Processing
+    audio_path = "temp_audio.wav"
+    extract_audio(video_path, audio_path)
     
-    report_lines.append("\n=== AUDIO EVENTS ===")
-    report_lines.append(f"{audio_events}")
-    report_lines.append("\n=== VISUAL LOGS ===")
+    transcript, segments = transcribe_audio(audio_path)
+    audio_events = detect_audio_events(audio_path)
     
-    free_gpu()
+    if os.path.exists(audio_path): os.remove(audio_path)
 
-    # --- Visual Models ---
-    logging.info("Loading Visual Models...")
-    yolo_engine = get_yolo_model()
-    blip_gen, blip_proc = get_blip_model()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # --- Process Video Frames ---
+    # 2. Visual Processing
+    logging.info("Starting Visual Analysis...")
+    yolo = get_yolo_model()
+    blip_model, blip_proc, device = get_blip_model()
+    
     cap = cv2.VideoCapture(video_path)
-    
+    fps = cap.get(cv2.CAP_PROP_FPS)
     frame_idx = 0
-    prev_hist = None
-    last_logged_time = -10
+    last_caption = ""
     
-    # --- FIX: Initialize variable to track the last text ---
-    last_caption = None 
+    report_data = []
+    report_data.append(f"Video: {video_path}\n=== TRANSCRIPT ===")
+    for s in segments:
+        report_data.append(f"[{seconds_to_timestr(s['start'])} -> {seconds_to_timestr(s['end'])}] {s['text']}")
     
-    SIMILARITY_THRESHOLD = 0.90 
-    FORCE_LOG_INTERVAL = 5.0 
-
-    logging.info("Starting visual analysis...")
+    report_data.append(f"\n=== AUDIO EVENTS ===\n{str(audio_events)}")
+    report_data.append("\n=== VISUAL LOG ===")
 
     while True:
         ret, frame = cap.read()
-        if not ret:
-            break
-        
+        if not ret: break
         frame_idx += 1
-        if frame_idx % sample_rate != 0:
-            continue
-
-        current_time = frame_idx / fps
         
-        # Scene Detection
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [50, 60], [0, 180, 0, 256])
-        cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+        if frame_idx % sample_rate != 0: continue
 
-        is_duplicate = False
-        if prev_hist is not None:
-            similarity = cv2.compareHist(prev_hist, hist, cv2.HISTCMP_CORREL)
-            if similarity > SIMILARITY_THRESHOLD:
-                if (current_time - last_logged_time) < FORCE_LOG_INTERVAL:
-                    is_duplicate = True
+        # Visual Chain
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_img = Image.fromarray(rgb_frame)
         
-        if is_duplicate:
-            continue
-
-        prev_hist = hist
-        last_logged_time = current_time
-        time_str = seconds_to_timestr(current_time)
-
-        # 1. YOLO
-        results = yolo_engine(frame, verbose=False)
-        yolo_descriptions = []
-        for result in results:
-            if result.boxes and result.boxes.data is not None:
-                for det in result.boxes.data.cpu().numpy():
-                    label = CLASS_MAP.get(int(det[5]), "Unknown")
-                    yolo_descriptions.append(label)
-        
-        yolo_text = ", ".join(list(set(yolo_descriptions))) if yolo_descriptions else None
-
-        # 2. BLIP
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(frame_rgb)
-        inputs = blip_proc(pil_img, return_tensors="pt").to(device)
         try:
-            output_ids = blip_gen.generate(**inputs, max_length=60, min_length=15, num_beams=5)
-            caption = blip_proc.decode(output_ids[0], skip_special_tokens=True)
-            
-            # --- FIX: Check for duplicate caption ---
-            if caption and caption == last_caption:
-                caption = None # Suppress this specific caption from the log
-            elif caption:
-                last_caption = caption # Update last seen caption
-                
+            inputs = blip_proc(pil_img, return_tensors="pt").to(device)
+            out = blip_model.generate(**inputs, max_length=50, min_length=10)
+            caption = blip_proc.decode(out[0], skip_special_tokens=True)
         except:
-            caption = None
+            caption = ""
 
-        # 3. Log
-        log_parts = []
-        if yolo_text: log_parts.append(f"Objects: [{yolo_text}]")
-        if caption: log_parts.append(f"Scene: {caption}")
+        # Filter & Deduplicate
+        if not caption or len(caption) < 5: continue
+        if caption.strip().lower() == last_caption.strip().lower(): continue
+        last_caption = caption
+
+        # YOLO (Only if scene is valid)
+        yolo_res = yolo(frame, verbose=False)
+        objects = []
+        for r in yolo_res:
+            for box in r.boxes:
+                cls_id = int(box.cls[0])
+                if cls_id in CLASS_MAP:
+                    objects.append(CLASS_MAP[cls_id])
+                else:
+                    objects.append("object")
         
-        if log_parts:
-            log_line = f"Time {time_str}: " + " | ".join(log_parts)
-            logging.info(log_line)
-            report_lines.append(log_line)
+        unique_objs = list(set(objects))
+        
+        timestamp = seconds_to_timestr(frame_idx / fps)
+        entry = f"Time {timestamp} | Scene: {caption} | Objects: {unique_objs}"
+        logging.info(entry)
+        report_data.append(entry)
 
     cap.release()
-    logging.info("Finished visual processing.")
     free_gpu()
 
-    # --- Write Final Report ---
-    report_filename = "report.txt"
-    try:
-        with open(report_filename, "w", encoding="utf-8") as rpt:
-            rpt.write("\n".join(report_lines))
-        logging.info("Report generated.")
-    except Exception as e:
-        logging.error(f"Error writing report: {e}")
-
-    # --- Generate Summaries (Smart Selection) ---
+    # 3. Save Final Report
+    with open("report.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(report_data))
+    
+    # 4. Generate JSON Bridge
     generate_video_descriptions(model_name)
-    free_gpu()
-
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Video Processing AI Tool (CLI Only)")
-    parser.add_argument("--video", type=str, required=True, help="Path to the video file to process")
-    
-    # Updated help text to reflect new "Smart Model" selection
-    parser.add_argument(
-        "--model", 
-        type=str, 
-        default="llama3", 
-        help="Model to use. Examples: 'llama3' (Ollama), 'gpt-4o' (OpenAI), or 'both' (Runs both)."
-    )
-    
-    parser.add_argument("--sample_rate", type=int, default=32, help="Process every Nth frame (default: 32)")
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--video", required=True)
+    parser.add_argument("--model", default="gpt-4o")
+    parser.add_argument("--sample_rate", type=int, default=250)
     args = parser.parse_args()
-
-    print(f"--- Running Video Processing ---")
-    print(f"Input: {args.video}")
-    print(f"Model Selection: {args.model}")
-    print(f"Sample Rate: {args.sample_rate}")
     
-    try:
-        process_video(
-            video_path=args.video,
-            model_name=args.model,
-            sample_rate=args.sample_rate
-        )
-        print("\n--- Processing Complete ---")
-        print("Results saved.")
-    except KeyboardInterrupt:
-        print("\nStopped by user.")
-    except Exception as e:
-        print(f"\nAn error occurred: {e}")
+    process_video(args.video, args.model, args.sample_rate)

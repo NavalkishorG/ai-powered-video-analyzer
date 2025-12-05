@@ -23,6 +23,7 @@ import gc
 import argparse
 from dotenv import load_dotenv  # Loads .env file
 from openai import OpenAI       # OpenAI Client
+import cv2 # Moved import to top level for better practice
 
 # --- Load Environment Variables ---
 load_dotenv()
@@ -105,7 +106,7 @@ def get_yolo_model():
     global global_yolo_model
     if global_yolo_model is None:
         logging.info("Loading YOLO model into memory...")
-        global_yolo_model = YOLO("yolo11s.pt")
+        global_yolo_model = YOLO("yolo11x.pt")
     return global_yolo_model
 
 def get_blip_model():
@@ -137,25 +138,31 @@ def extract_audio(video_path, audio_path):
             raise ValueError("No audio track found in the video.")
         clip.audio.write_audiofile(audio_path, logger=None)
 
-def transcribe_audio(audio_file, language=None):
-    waveform, sr = preprocess_audio(audio_file)
-    proc_audio = "temp_proc_audio.wav"
-    sf.write(proc_audio, waveform, sr)
-    if language == "fas": language = "fa"
+# --- UPDATED: Return segments for timeline ---
+def transcribe_audio(audio_file, language="en"):  # Force default to English
+    # REMOVED: waveform, sr = preprocess_audio(audio_file) 
+    # Directly use the file extracted by MoviePy, it is cleaner.
+    
+    segments = [] 
+    
     try:
-        result = whisper_model.transcribe(proc_audio, task="transcribe", language=language)
-        detected_language = result.get("language", "unknown")
-        logging.info("Detected audio language: %s", detected_language)
+        # Load the model with specific decoding options to reduce hallucinations
+        options = dict(language="en", task="transcribe", condition_on_previous_text=False)
+        
+        # Use the raw audio_file directly
+        result = whisper_model.transcribe(audio_file, **options)
+        
+        detected_language = "en" # We forced it
         transcription = result["text"]
+        segments = result.get("segments", [])
+        
     except Exception as e:
         logging.error("Error in audio transcription: %s", str(e))
         transcription = ""
-        detected_language = "unknown"
+        segments = []
+        detected_language = "error"
     
-    if os.path.exists(proc_audio): os.remove(proc_audio)
-    if detected_language.lower() == "unknown" or not detected_language: detected_language = "eng"
-    free_gpu()
-    return transcription, detected_language
+    return transcription, segments, detected_language
 
 def detect_audio_events(audio_file):
     try:
@@ -210,42 +217,51 @@ panns_model = AudioTagging(checkpoint_path=PANN_MODEL_PATH)
 free_gpu()
 print_hardware_usage()
 
-# --- PROMPT GENERATION (Shared) ---
+# --- UPDATED: Prompt to ask for quotes/timeline ---
 def get_viral_prompt(report_text):
     return (
         f"""
         You are an expert Video Content Analyst.
-        Analyze the provided video report (audio transcript & visual logs) to generate a comprehensive content breakdown.
+        Analyze the provided video report (timestamped audio transcript & visual logs) to generate a comprehensive breakdown.
 
-        The video genre could be anything (Educational, Comedy, Marketing, Vlog, News, etc.). Adapt your analysis to fit the specific content found in the report.
-
-        Please provide the following four sections:
+        --- CRITICAL TIMESTAMP LOGIC: MERGING SEGMENTS ---
+        1. The transcript is split into small blocks (e.g., `[00:04:14 --> 00:04:24]`).
+        2. A complete sentence often flows across multiple blocks.
+        3. You MUST **MERGE** the timestamps for the full context.
+        4. **METHOD**:
+           - Identify the **First Block** where the quote starts. Take its **Start Time**.
+           - Identify the **Last Block** where the quote ends. Take its **End Time**.
+           - Combine them into one range: `[Start of First --> End of Last]`.
+        
+        *Example of Merging:*
+        - Block A: `[00:04:14 --> 00:04:24] I think that video...`
+        - Block B: `[00:04:24 --> 00:04:29] ...is the future.`
+        - **YOUR OUTPUT**: `[00:04:14 --> 00:04:29]` (Start of A to End of B)
+        -------------------------------------------------------------
 
         ### 1. VIDEO OVERVIEW
-        * **Genre:** (Identify the genre based on the transcript and visuals)
-        * **Summary:** (A cohesive narrative paragraph describing the flow of events and spoken content)
+        * **Genre:** (Identify the genre)
+        * **Summary:** (A cohesive narrative paragraph describing the flow)
         * **Target Audience:** (Who is this video for?)
 
         ### 2. ENGAGING DESCRIPTION (Social Media Ready)
-        Write a compelling caption/description for this video.
         * **Hook:** (The opening line)
         * **Body:** (The core message/story)
-        * **Key Takeaways:** (Bullet points of main features or funny moments)
+        * **Key Takeaways:** (Bullet points of main features)
 
         ### 3. IMPORTANT TIMESTAMPS
-        Locate the specific "Time XX:XX:XX" from the report for these moments. 
-        If a category (like "Solution") doesn't fit the genre, label it as the equivalent key moment (e.g., "The Climax" or "The Punchline").
-        
-        * **The Hook:** [Timestamp] - (When the viewer's attention is grabbed)
-        * **The Problem / Conflict:** [Timestamp] - (When the issue or tension is introduced)
-        * **The Solution / Climax:** [Timestamp] - (The resolution, product reveal, or main event)
-        * **Key Feature / Highlight:** [Timestamp] - (A specific visual or auditory detail that stands out)
-        * **The "Viral" Moment:** [Timestamp] - (The single most engaging/shareable segment)
-        * **Call to Action / Ending:** [Timestamp] - (How the video concludes)
+        Select the most critical moments. 
+        * **The Hook:** [Start --> End] - "Exact quote from transcript..." - (Description)
+        * **The Conflict:** [Start --> End] - "Exact quote from transcript..." - (Description)
+        * **The Climax/Solution:** [Start --> End] - "Exact quote from transcript..." - (Description)
+        * **Key Highlight:** [Start --> End] - "Exact quote from transcript..." - (Description)
+        * **The Viral Moment:** [Start --> End] - "Exact quote from transcript..." - (Description)
+        * **Conclusion:** [Start --> End] - "Exact quote from transcript..." - (Description)
 
         ### 4. VIRAL EDIT STRATEGY
-        * **Best Short Clip:** (Start Time to End Time for a 15-60s clip)
-        * **Reasoning:** (Why this specific segment captures the full essence of the video)
+        * **Best Short Clip:** [Start Time --> End Time] (MERGE blocks if necessary to capture the full thought)
+        * **Transcript:** (The full dialogue spoken during this merged timeframe)
+        * **Reasoning:** (Why this segment is the best)
 
         ---
         REPORT DATA:
@@ -366,7 +382,7 @@ def generate_video_descriptions(model_arg):
         except Exception as e:
             logging.error(f"Error saving OpenAI description: {e}")
 
-# --- Main Video Processing Function ---
+# --- UPDATED: Process Video (Deduplication + Timeline Write) ---
 def process_video(video_path, model_name, sample_rate=1):
     if not os.path.exists(video_path):
         logging.error("File does not exist: %s", video_path)
@@ -417,20 +433,34 @@ def process_video(video_path, model_name, sample_rate=1):
     extract_audio(video_path, temp_audio_path)
 
     audio_transcript = ""
+    audio_segments = [] # Variable for segments
+    
     if os.path.exists(temp_audio_path):
         logging.info("Transcribing audio...")
-        audio_transcript, _ = transcribe_audio(temp_audio_path)
+        # Unpack the 3 values
+        audio_transcript, audio_segments, _ = transcribe_audio(temp_audio_path)
+        
         logging.info("Detecting audio events...")
         audio_events = detect_audio_events(temp_audio_path)
         os.remove(temp_audio_path)
     else:
         audio_events = {"No audio": []}
 
-    report_lines.append("Audio Analysis:")
-    report_lines.append(f"  Transcription: {audio_transcript}")
-    report_lines.append(f"  Audio Events: {audio_events}")
-    report_lines.append("")
-
+    # --- NEW: Write detailed transcript to report ---
+    report_lines.append("=== TIMELINED AUDIO TRANSCRIPT ===")
+    if audio_segments:
+        for seg in audio_segments:
+            start_str = seconds_to_timestr(seg['start'])
+            end_str = seconds_to_timestr(seg['end'])
+            text = seg['text'].strip()
+            report_lines.append(f"[{start_str} --> {end_str}] {text}")
+    else:
+        report_lines.append("No dialogue detected.")
+    
+    report_lines.append("\n=== AUDIO EVENTS ===")
+    report_lines.append(f"{audio_events}")
+    report_lines.append("\n=== VISUAL LOGS ===")
+    
     free_gpu()
 
     # --- Visual Models ---
@@ -440,12 +470,15 @@ def process_video(video_path, model_name, sample_rate=1):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # --- Process Video Frames ---
-    import cv2
     cap = cv2.VideoCapture(video_path)
     
     frame_idx = 0
     prev_hist = None
     last_logged_time = -10
+    
+    # --- FIX: Initialize variable to track the last text ---
+    last_caption = None 
+    
     SIMILARITY_THRESHOLD = 0.90 
     FORCE_LOG_INTERVAL = 5.0 
 
@@ -499,6 +532,13 @@ def process_video(video_path, model_name, sample_rate=1):
         try:
             output_ids = blip_gen.generate(**inputs, max_length=60, min_length=15, num_beams=5)
             caption = blip_proc.decode(output_ids[0], skip_special_tokens=True)
+            
+            # --- FIX: Check for duplicate caption ---
+            if caption and caption == last_caption:
+                caption = None # Suppress this specific caption from the log
+            elif caption:
+                last_caption = caption # Update last seen caption
+                
         except:
             caption = None
 
